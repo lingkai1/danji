@@ -51,6 +51,7 @@
 #include "gpio.h"
 
 /* USER CODE BEGIN Includes */
+#include "app.h"
 #include <string.h>
 /* USER CODE END Includes */
 
@@ -74,14 +75,97 @@ void Error_Handler(void);
 FATFS SDFatFs;
 FIL MyFile;
 char SDPath[4];
-uint8_t usartBuffer[10];
+uint8_t gpsRxBuffer[51];  // 先看成是MSB的
+uint8_t gpsStart[5] = {0xAA,0xEE,0x05,0x33,0xD0};
+// file write variable
 
+FRESULT res;                                          /* FatFs function common result code */
+uint32_t byteswritten;// bytesread;                     /* File write/read counts */
+uint8_t wtext[] = "hello world!\n"; /* File write buffer */
 
-void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart)
+uint8_t motorRxbuffer[31];
+
+uint8_t rxByte;
+
+MotorRxDataUnion motorRxData;
+uint8_t countReceived = 0;
+uint8_t uart4RxState = 0;
+gpsDataType gpsData;
+gpsDataType gpsDataBuf[100];
+gpsDataType *Ptr = (gpsDataType *)gpsDataBuf;
+long countGps = 0;
+void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart)   // 由DMA触发进入的串口中断
 {
-	printf("{\n");
-	HAL_UART_Transmit(&huart4, (uint8_t *)usartBuffer, 10,0xFFFF);
-	printf("}\n");
+	if(huart->Instance == USART2)
+	{
+		if(gpsRxBuffer[0] == 0xEE && gpsRxBuffer[1] == 0xDD && gpsRxBuffer[50] == uint8Sum(gpsRxBuffer,50))
+		{
+			gpsData.starNumber = gpsRxBuffer[9];
+			gpsData.year = ((uint16_t)gpsRxBuffer[11]<<8) + gpsRxBuffer[10];
+			gpsData.month = gpsRxBuffer[12];
+			gpsData.day = gpsRxBuffer[13];
+			gpsData.hour = gpsRxBuffer[14];
+			gpsData.minute = gpsRxBuffer[15];
+			gpsData.second = gpsRxBuffer[16];
+			gpsData.ms = ((uint16_t)gpsRxBuffer[18]<<8) + gpsRxBuffer[17];
+			
+			gpsData.longitude = ((uint32_t)gpsRxBuffer[22]<<24) + ((uint32_t)gpsRxBuffer[21]<<16) + ((uint32_t)gpsRxBuffer[20]<<8) + (uint32_t)gpsRxBuffer[19]; // 读取经度
+			gpsData.latitude = ((uint32_t)gpsRxBuffer[26]<<24) + ((uint32_t)gpsRxBuffer[25]<<16) + ((uint32_t)gpsRxBuffer[24]<<8) + (uint32_t)gpsRxBuffer[23];  // 读任扯取
+			gpsData.altitude = ((uint32_t)gpsRxBuffer[30]<<24) + ((uint32_t)gpsRxBuffer[29]<<16) + ((uint32_t)gpsRxBuffer[28]<<8) + (uint32_t)gpsRxBuffer[27];  // 读取海拔
+					
+			gpsData.northSpeed = ((uint32_t)gpsRxBuffer[32]<<8) + (uint32_t)gpsRxBuffer[31];																																	// 北向速度
+			gpsData.upSpeed = ((uint32_t)gpsRxBuffer[34]<<8) + (uint32_t)gpsRxBuffer[33];																																	// 天向速度
+			gpsData.eastSpeed = ((uint32_t)gpsRxBuffer[36]<<8) + (uint32_t)gpsRxBuffer[35];	
+
+			gpsData.PDOP = ((uint16_t)gpsRxBuffer[38]<<8) + gpsRxBuffer[37];
+			gpsData.GDOP = ((uint16_t)gpsRxBuffer[40]<<8) + gpsRxBuffer[39];
+			*(Ptr+countGps) = gpsData;
+			countGps ++;
+			
+			if(countGps >= 100)
+			{
+				writeGPS();
+				countGps = 0;
+			}
+		}
+		HAL_UART_Receive_IT(&huart2, (uint8_t *)gpsRxBuffer, sizeof(gpsRxBuffer));
+	}
+	
+	if(huart->Instance == UART4)
+	{			
+			switch(uart4RxState)
+			{
+				case 0:if(rxByte == 0xAA) uart4RxState = 1;break;
+				case 1:if(rxByte == 0x55) 
+							{					
+								uart4RxState = 2;
+								motorRxData.y[0] = 0xAA;
+								motorRxData.y[1] = 0x55;
+								}
+				        else if(rxByte == 0xAA)uart4RxState = 1; break;   // 返回1的状态
+				case 2: 
+					    if(countReceived < 28) //  除了帧头 校验位-3还有28 个字节要收
+							{		
+								motorRxData.y[countReceived+2] = rxByte; // 前三个单元放了 0xAA 0x55
+								countReceived++;
+							}
+							else                                   //  校验位 -接受完成~                                      
+							{
+								int temp = uint8Sum(motorRxData.y,30);
+							  motorRxData.y[30] = rxByte;
+								if( temp == rxByte)
+										writeSD();
+								countReceived = 0;
+								uart4RxState = 0;
+							}
+							break;
+				
+				default:break;
+		}
+			HAL_UART_Receive_IT(&huart4, &rxByte, sizeof(rxByte));
+	}
+	
+	
 }
 /* USER CODE END 0 */
 
@@ -89,10 +173,11 @@ int main(void)
 {
 
   /* USER CODE BEGIN 1 */
-  FRESULT res;                                          /* FatFs function common result code */
-  uint32_t byteswritten, bytesread;                     /* File write/read counts */
-  uint8_t wtext[] = "This is STM32 working with FatFs"; /* File write buffer */
-  uint8_t rtext[100];                                   /* File read buffer */
+
+
+//  uint8_t rtext[100];      
+//  printf("hello \n");                           
+	/* File read buffer */
   /* USER CODE END 1 */
 
   /* MCU Configuration----------------------------------------------------------*/
@@ -114,108 +199,50 @@ int main(void)
   MX_USART2_UART_Init();
   MX_USART3_UART_Init();
   MX_FATFS_Init();
-	HAL_UART_Receive_DMA(&huart4, (uint8_t *)usartBuffer, sizeof(usartBuffer));
+
   /* USER CODE BEGIN 2 */
 		    /*##-2- Register the file system object to the FatFs module ##############*/
     if(f_mount(&SDFatFs, (TCHAR const*)SDPath, 0) != FR_OK)
     {
       /* FatFs Initialization Error */
 			
-			printf("FatFs Initialization Error");
+			//printf("FatFs Initialization Error");
       Error_Handler();
     }
-    else
-    {
-      /*##-3- Create a FAT file system (format) on the logical drive #########*/
-      /* WARNING: Formatting the uSD card will delete all content on the device */
+		 // 建FAT 文件系统，不是每次都有必要。
       if(f_mkfs((TCHAR const*)SDPath, 0, 0) != FR_OK)
       {
         /* FatFs Format Error */
-				printf("FatFs Format Error ");
+				//printf("FatFs Format Error ");
         Error_Handler();
       }
-      else
-      {       
-        /*##-4- Create and Open a new text file object with write access #####*/
-        if(f_open(&MyFile, "STM32.TXT", FA_CREATE_ALWAYS | FA_WRITE) != FR_OK)
-        {
-          /* 'STM32.TXT' file Open for write Error */
-					printf("STM32.TXT' file Open for write Error");
-          Error_Handler();
-        }
-        else
-        {
-          /*##-5- Write data to the text file ################################*/
-          res = f_write(&MyFile, wtext, sizeof(wtext), (void *)&byteswritten);
-          
-          if((byteswritten == 0) || (res != FR_OK))
-          {
-            /* 'STM32.TXT' file Write or EOF Error */
-						printf("'STM32.TXT' file Write or EOF Error");
-            Error_Handler();
-          }
-          else
-          {
-            /*##-6- Close the open text file #################################*/
-            f_close(&MyFile);
-            
-            /*##-7- Open the text file object with read access ###############*/
-            if(f_open(&MyFile, "STM32.TXT", FA_READ) != FR_OK)
-            {
-              /* 'STM32.TXT' file Open for read Error */
-							printf("'STM32.TXT' file Open for read Error ");
-              Error_Handler();
-            }
-            else
-            {
-              /*##-8- Read data from the text file ###########################*/
-              res = f_read(&MyFile, rtext, sizeof(rtext), (UINT*)&bytesread);
-              
-              if((bytesread == 0) || (res != FR_OK))
-              {
-                /* 'STM32.TXT' file Read or EOF Error */
-								printf("'STM32.TXT' file Read or EOF Error");
-                Error_Handler();
-              }
-              else
-              {
-                /*##-9- Close the open text file #############################*/
-                f_close(&MyFile);
-                
-                /*##-10- Compare read data with the expected data ############*/
-                if((bytesread != byteswritten))
-                {                
-                  /* Read data is different from the expected data */
-									
-									printf("Read data is different from the expected data");
-                  Error_Handler();
-                }
-                else
-                {
-                  /* Success of the demo: no error occurrence */
-                 // BSP_LED_On(LED1);
-									printf("all process succeed");
-                }
-              }
-            }
-          }
-        }
-      }
-    }
+//		 if(f_open(&MyFile, "STM32.TXT", FA_CREATE_ALWAYS | FA_WRITE) != FR_OK)
+//     {
+//          /* 'STM32.TXT' file Open for write Error */
+//					//printf("STM32.TXT' file Open for write Error");
+//          Error_Handler();
+//      }
+//		 f_close(&MyFile);
+//		 
   /* USER CODE END 2 */
 
   /* Infinite loop */
   /* USER CODE BEGIN WHILE */
+	HAL_UART_Transmit_IT(&huart2, (uint8_t *)gpsStart, sizeof(gpsStart));
+	HAL_UART_Receive_IT(&huart2, (uint8_t *)gpsRxBuffer, sizeof(gpsRxBuffer));
+	
+
+	HAL_UART_Receive_IT(&huart4, &rxByte, sizeof(rxByte));
+	//HAL_TIM_Base_Start_IT(&htim3);
+	//HAL_TIM_Base_Start_IT(&htim4);
   while (1)
   {
   /* USER CODE END WHILE */
 
   /* USER CODE BEGIN 3 */
-		uint8_t aTxMessage[] = "\r\n**** UART-Hyperterminal communication based on DMA ***\r\n    WaveShare Open7XXI-C Board \r\n";
-		//HAL_UART_Transmit_DMA(&huart1, (uint8_t *)aTxMessage, sizeof(aTxMessage));
-		//printf("hello world"); 
-		HAL_Delay(200);
-
+		//HAL_UART_Transmit_IT(&huart2, (uint8_t *)gpsStart, sizeof(gpsStart));
+ 		//HAL_UART_Transmit_IT(&huart4, (uint8_t *)motorTxbuffer, sizeof(motorTxbuffer));
+    HAL_Delay(1000);
   }
   /* USER CODE END 3 */
 
@@ -277,7 +304,11 @@ void SystemClock_Config(void)
 }
 
 /* USER CODE BEGIN 4 */
-
+void HAL_UART_ErrorCallback(UART_HandleTypeDef *huart)
+{
+		HAL_UART_Receive_IT(&huart4, &rxByte, sizeof(&rxByte));
+		HAL_UART_Receive_IT(&huart2, (uint8_t *)gpsRxBuffer, sizeof(gpsRxBuffer));
+}
 /* USER CODE END 4 */
 
 /**
